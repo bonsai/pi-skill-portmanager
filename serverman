@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# serverman — スキル・ポート・プロセス・URL 一元管理
+#   serverman ls                            全スキルサーバー一覧
+#   serverman ports                           ポート占用 + node.exe 一覧
+#   serverman start <skill>                   スキルサーバーを起動
+#   serverman stop <skill|port|pid>           スキル/ポート/PID で停止
+#   serverman restart <skill>                 再起動
+#   serverman open <skill>                    ブラウザでURLを開く
+#   serverman register <name> <port> <dir> <cmd>  新スキルを登録
+#   serverman qr <skill>                      QRコードを表示（テザリング対応）
+#   serverman health                          全スキルの生存確認
+
+CONFIG="/mnt/c/Users/0501JP/.config/opencode/skills/portmanager/.serverman.conf"
+
+# デフォルト登録
+init_config() {
+  if [ ! -f "$CONFIG" ]; then
+    cat > "$CONFIG" <<EOF
+# serverman config — スキル名=ポート: directory: start_command: url_path
+2077-art=8787:/mnt/c/Users/0501JP/.config/opencode/skills/2077-art:node tools/remote-server.mjs 8787:/preview/part03_present.html
+hokusai-manga=8080:/mnt/c/Users/0501JP/.config/opencode/skills/hokusai-manga:python agents/skills/viewer/server.py:/dashboard.html
+xkcd-mashup=3000:/mnt/c/Users/0501JP/.config/opencode/skills/xkcd-mashup:node server.mjs:/index.html
+EOF
+  fi
+}
+
+read_config() {
+  init_config
+  while IFS='=' read -r name rest; do
+    [ "${name:0:1}" = "#" ] && continue
+    [ -z "$name" ] && continue
+    port="${rest%%:*}"
+    tmp="${rest#*:}"
+    dir="${tmp%%:*}"
+    tmp2="${tmp#*:}"
+    cmd="${tmp2%%:*}"
+    url="${tmp2#*:}"
+    echo "${name}|${port}|${dir}|${cmd}|${url}"
+  done < "$CONFIG"
+}
+
+_get_pid_by_port() {
+  port="$1"
+  powershell.exe -NoProfile -Command "
+    \$conn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+    if (\$conn) { \$conn.OwningProcess } else { 0 }
+  " 2>/dev/null | tr -d '\r'
+}
+
+_get_ports_by_pid() {
+  pid="$1"
+  powershell.exe -NoProfile -Command "
+    Get-NetTCPConnection -OwningProcess $pid -ErrorAction SilentlyContinue |
+    ForEach-Object { \$_.LocalPort } | Sort-Object -Unique
+  " 2>/dev/null | tr -d '\r' | tr '\n' ' '
+}
+
+_get_cmdline() {
+  pid="$1"
+  powershell.exe -NoProfile -Command "(Get-WmiObject Win32_Process -Filter \"ProcessId=$pid\").CommandLine" 2>/dev/null | tr -d '\r'
+}
+
+_ls() {
+  echo "=== 登録済みスキルサーバー ==="
+  printf "%-20s %-6s %-8s %-8s %s\n" "スキル名" "ポート" "PID" "状態" "URL"
+  echo "-------------------- ------ -------- -------- ------------------------------"
+  while IFS='|' read -r name port dir cmd url; do
+    pid=$(_get_pid_by_port "$port")
+    status="stopped"
+    [ "$pid" != "0" ] && [ -n "$pid" ] && status="running"
+    [ "$status" = "running" ] && cmdline="$(_get_cmdline "$pid" | cut -c1-30)" || cmdline="$cmd"
+    printf "%-20s %-6s %-8s %-8s %s\n" "$name" "$port" "${pid:-0}" "$status" "http://localhost:${port}${url}"
+  done <<< "$(read_config)"
+}
+
+ports() {
+  echo "=== ポート＋プロセス統合 ==="
+  echo "ポート    PID      Type        CommandLine"
+  echo "--------  -------- ------      ----------"
+  powershell.exe -NoProfile -Command '
+    Get-NetTCPConnection -State Listen |
+    Select-Object LocalPort, OwningProcess, @{N="Type";E={
+      $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+      if ($proc) { $proc.ProcessName } else { "?" }
+    }}, @{N="Cmd";E={
+      $cmd = (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.OwningProcess)").CommandLine
+      if ($cmd.Length -gt 60) { $cmd.Substring(0,57)+"..." } else { $cmd }
+    }} |
+    Sort-Object LocalPort |
+    Format-Table -AutoSize
+  '
+}
+
+start_skill() {
+  name="${1:-}"
+  [ -z "$name" ] && { echo "Usage: serverman start <skill-name>"; exit 1; }
+  found=""
+  while IFS='|' read -r n port dir cmd url; do
+    [ "$n" = "$name" ] && found="1" && break
+  done <<< "$(read_config)"
+  [ -z "$found" ] && { echo "Unknown skill: $name. Run 'serverman register' to add."; exit 1; }
+  
+  pid=$(_get_pid_by_port "$port")
+  if [ "$pid" != "0" ] && [ -n "$pid" ]; then
+    echo "$name は既に PID $pid で実行中です。"
+    return
+  fi
+  
+  echo "Starting $name on port $port..."
+  (
+    cd "$dir"
+    eval "$cmd" > /dev/null 2>&1 &
+  )
+  sleep 2
+  newpid=$(_get_pid_by_port "$port")
+  if [ "$newpid" != "0" ] && [ -n "$newpid" ]; then
+    echo "Started. PID=$newpid  http://localhost:${port}${url}"
+  else
+    echo "Start requested but port not immediately responsive (normal for slow startup)"
+  fi
+}
+
+stop_skill() {
+  target="${1:-}"
+  [ -z "$target" ] && { echo "Usage: serverman stop <skill|port|pid>"; exit 1; }
+  
+  # skill name?
+  while IFS='|' read -r name port dir cmd url; do
+    if [ "$name" = "$target" ]; then
+      pid=$(_get_pid_by_port "$port")
+      if [ "$pid" != "0" ] && [ -n "$pid" ]; then
+        echo "Stopping $name (PID=$pid, port=$port)..."
+        powershell.exe -NoProfile -Command "Stop-Process -Id $pid -Force"
+        echo "Stopped."
+      else
+        echo "$name は既に停止しています。"
+      fi
+      return
+    fi
+  done <<< "$(read_config)"
+  
+  # port number?
+  if [[ "$target" =~ ^[0-9]+$ ]] && [ "$target" -lt 65536 ]; then
+    pid=$(_get_pid_by_port "$target")
+    if [ "$pid" != "0" ] && [ -n "$pid" ]; then
+      echo "Stopping process on port $target (PID=$pid)..."
+      powershell.exe -NoProfile -Command "Stop-Process -Id $pid -Force"
+      echo "Stopped."
+    else
+      echo "Port $target は空いています。"
+    fi
+    return
+  fi
+  
+  # pid?
+  if [[ "$target" =~ ^[0-9]+$ ]]; then
+    echo "Stopping PID $target..."
+    powershell.exe -NoProfile -Command "Stop-Process -Id $target -Force"
+    echo "Stopped."
+    return
+  fi
+  
+  echo "Unknown target: $target"
+  exit 1
+}
+
+restart_skill() {
+  name="${1:-}"
+  [ -z "$name" ] && { echo "Usage: serverman restart <skill>"; exit 1; }
+  stop_skill "$name"
+  sleep 2
+  start_skill "$name"
+}
+
+open_url() {
+  name="${1:-}"
+  [ -z "$name" ] && { echo "Usage: serverman open <skill>"; exit 1; }
+  while IFS='|' read -r n port dir cmd url; do
+    [ "$n" = "$name" ] || continue
+    fullurl="http://localhost:${port}${url}"
+    echo "Opening: $fullurl"
+    powershell.exe -NoProfile -Command "Start-Process '$fullurl'"
+    return
+  done <<< "$(read_config)"
+  echo "Unknown skill: $name"; exit 1
+}
+
+register() {
+  name="${1:-}"; port="${2:-}"; dir="${3:-}"; cmd="${4:-}"; url="${5:-/}"
+  ([ -z "$name" ] || [ -z "$port" ] || [ -z "$dir" ] || [ -z "$cmd" ]) && {
+    echo "Usage: serverman register <name> <port> <directory> <command> [url_path]"
+    echo "  ex: serverman register myapp 8080 /home/user/myapp 'node server.mjs' /index.html"
+    exit 1
+  }
+  echo "${name}=${port}:${dir}:${cmd}:${url}" >> "$CONFIG"
+  echo "Registered: $name (port=$port, dir=$dir, cmd='$cmd', url=$url)"
+}
+
+qr() {
+  name="${1:-}"
+  [ -z "$name" ] && { echo "Usage: serverman qr <skill>"; exit 1; }
+  while IFS='|' read -r n port dir cmd url; do
+    [ "$n" = "$name" ] || continue
+    # IP自動検出（テザリング優先）
+    ip=$(powershell.exe -NoProfile -Command "
+      \$ips = Get-NetIPAddress -AddressFamily IPv4 |
+        Where-Object { -not \$_.IPAddress.StartsWith('127.') -and \$_.IPAddress -notmatch '^172\.1[7-9]\\.' -and \$_.IPAddress -notmatch '^192\.168\\.(1\\d{3}|2[0-4][0-9]|25[0-5])$' } |
+        Sort-Object { if (\$_.IPAddress -match '192\.168\.') { 0 } else { 1 } }
+      if (\$ips) { \$ips[0].IPAddress } else { 'localhost' }
+    " | tr -d '\r')
+    fullurl="http://${ip}:${port}${url}"
+    echo "スマホなどはこちら: $fullurl"
+    echo ""
+    # QRコード（terminal出力）
+    if command -v qrencode >/dev/null 2>&1; then
+      qrencode -t ansiutf8 "$fullurl"
+    elif command -v npx >/dev/null 2>&1; then
+      echo "npx qrcode-terminal '$fullurl' でQRを表示できます"
+    else
+      echo "QR表示ツール未インストール"
+    fi
+    echo ""
+    echo "PCで開く: http://localhost:${port}${url}"
+    return
+  done <<< "$(read_config)"
+  echo "Unknown skill: $name"; exit 1
+}
+
+health() {
+  echo "=== Health Check ==="
+  err=0
+  while IFS='|' read -r name port dir cmd url; do
+    pid=$(_get_pid_by_port "$port")
+    status="❌ dead"
+    [ "$pid" != "0" ] && [ -n "$pid" ] && status="✅ OK (PID=$pid)"
+    printf "%-20s %-6s %s\n" "$name" "$port" "$status"
+    [ "$pid" = "0" ] && err=1
+  done <<< "$(read_config)"
+  [ $err -eq 1 ] && exit 1 || exit 0
+}
+
+cmd="${1:-ls}"
+case "$cmd" in
+  ls|list|status) _ls ;;
+  ports) ports ;;
+  start) start_skill "${2:-}" ;;
+  stop) stop_skill "${2:-}" ;;
+  restart) restart_skill "${2:-}" ;;
+  open) open_url "${2:-}" ;;
+  register) register "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-/}" ;;
+  qr) qr "${2:-}" ;;
+  health) health ;;
+  *)
+    echo "Usage: serverman [ls|ports|start <skill>|stop <skill|port|pid>|restart <skill>|open <skill>|qr <skill>|register ...|health]"
+    echo ""
+    echo "Quick start:"
+    echo "  serverman ls         一覧と状態確認"
+    echo "  serverman start      全スキル起動"
+    echo "  serverman stop all   全停止 (use 'nodeman kill all' for node)"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# portmap — ポート・プロセス・スキル一元管理マップ
+#   portmap ls              全プロセス一覧（node.exe 中心）
+#   portmap ports           ポート→プロセス→スキル対応表
+#   portmap skills          スキル名→ポート→URL対応表
+#   portmap kill <pid|port> PID or ポート占有プロセスを停止
+#   portmap kill-all-node   全 node.exe を停止
+#   portmap start <name>    登録済みスキルのサーバーを起動
+
+declare -A SKILL_PORT_MAP=(
+  ["1028-remote-server"]=8787
+  ["hokusai-manga-viewer"]=8080
+  ["hokusai-manga-vlm"]=5000
+  ["mppdp5-port-manager"]=9000
+)
+
+declare -A SKILL_URL_MAP=(
+  ["1028-remote-server"]="/preview/part03_present.html"
+  ["hokusai-manga-viewer"]="/dashboard.html"
+)
+
+declare -A SKILL_START_CMD=(
+  ["1028-remote-server"]="node tools/remote-server.mjs 8787"
+  ["hokusai-manga-viewer"]="python agents/skills/viewer/server.py"
+)
+
+declare -A SKILL_DIR_MAP=(
+  ["1028-remote-server"]="/mnt/c/Users/0501JP/.config/opencode/skills/1028/40-submit"
+  ["hokusai-manga-viewer"]="/mnt/c/Users/0501JP/.config/opencode/skills/hokusai-manga"
+)
+
+ls_procs() {
+  echo "=== Node.exe プロセス一覧 ==="
+  if command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command '
+      Get-WmiObject Win32_Process |
+      Where-Object { $_.Name -eq "node.exe" } |
+      ForEach-Object {
+        $cmd_short = ($_.CommandLine -replace "^.*nodejs[\\\\/]?node\.exe\",`"" -replace "^\`"C:\\"+".*node\.exe`"+" ","").Trim()
+        if ($cmd_short.Length -gt 60) { $cmd_short = $cmd_short.Substring(0,57)+"..." }
+        [PSCustomObject]@{
+          PID = $_.ProcessId
+          Command = $cmd_short
+        }
+      } | Format-Table -AutoSize
+    '
+  else
+    echo "powershell.exe not available"
+  fi
+  echo ""
+  echo "=== Port占用状況 ==="
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -E '^(State|LISTEN)' || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ano | grep LISTENING || true
+  else
+    echo "ss/netstat not available"
+  fi
+}
+
+ls_ports() {
+  echo "=== ポート→プロセス→スキル 対応表 ==="
+  echo "ポート    PID      スキル名                経路"
+  echo "--------  -------- ---------------------- ------------------------------"
+  if command -v powershell.exe >/dev/null 2>&1; then
+    for skill in "${!SKILL_PORT_MAP[@]}"; do
+      port="${SKILL_PORT_MAP[$skill]}"
+      pid=$(powershell.exe -NoProfile -Command "
+        \$conn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+        if (\$conn) { \$conn.OwningProcess } else { 0 }
+      " 2>/dev/null | tr -d '\r')
+      if [ "$pid" != "0" ] && [ -n "$pid" ]; then
+        printf "%-8s  %-8s %-22s %s\n" "$port" "$pid" "$skill" "${SKILL_DIR_MAP[$skill]:-}"
+      else
+        printf "%-8s  %-8s %-22s %s\n" "$port" "(free)" "$skill" "---"
+      fi
+    done
+  else
+    for skill in "${!SKILL_PORT_MAP[@]}"; do
+      printf "%-8s  %-8s %-22s %s\n" "${SKILL_PORT_MAP[$skill]}" "?" "$skill" "${SKILL_DIR_MAP[$skill]:-}"
+    done
+  fi
+}
+
+ls_skills() {
+  echo "=== スキル名→ポート→URL 対応表 ==="
+  echo "スキル名                ポート   状態    URL"
+  echo "---------------------- -------- ------ ------------------------------"
+  if command -v powershell.exe >/dev/null 2>&1; then
+    for skill in "${!SKILL_PORT_MAP[@]}"; do
+      port="${SKILL_PORT_MAP[$skill]}"
+      pid=$(powershell.exe -NoProfile -Command "
+        \$conn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+        if (\$conn) { \$conn.OwningProcess } else { 0 }
+      " 2>/dev/null | tr -d '\r')
+      status=" stopped"
+      [ "$pid" != "0" ] && [ -n "$pid" ] && status="running"
+      url="${SKILL_URL_MAP[$skill]:-}"
+      printf "%-22s %-8s %-7s %s\n" "$skill" "$port" "$status" "${url:----}"
+    done
+  else
+    for skill in "${!SKILL_PORT_MAP[@]}"; do
+      printf "%-22s %-8s %-7s %s\n" "$skill" "${SKILL_PORT_MAP[$skill]}" "?" "${SKILL_URL_MAP[$skill]:-}"
+    done
+  fi
+}
+
+kill_by_target() {
+  target="$1"
+  if [[ "$target" =~ ^[0-9]+$ ]]; then
+    if [ "$target" -gt 0 ] && [ "$target" -lt 65536 ]; then
+      # port number
+      echo "Port $target の占有プロセスを検索..."
+      pid=$(powershell.exe -NoProfile -Command "
+        \$conn = Get-NetTCPConnection -LocalPort $target -ErrorAction SilentlyContinue
+        if (\$conn) { \$conn.OwningProcess } else { 0 }
+      " 2>/dev/null | tr -d '\r')
+      if [ "$pid" != "0" ] && [ -n "$pid" ]; then
+        echo "Found PID $pid on port $target. Stopping..."
+        powershell.exe -NoProfile -Command "Stop-Process -Id $pid -Force"
+      else
+        echo "Port $target is free or not found."
+      fi
+    else
+      # PID
+      echo "Stopping PID $target..."
+      powershell.exe -NoProfile -Command "Stop-Process -Id $target -Force"
+    fi
+  else
+    echo "Usage: portmap kill <pid|port>"
+    exit 1
+  fi
+}
+
+kill_all_node() {
+  echo "Stopping all node.exe processes..."
+  powershell.exe -NoProfile -Command "Get-Process -Name node -ErrorAction SilentlyContinue | Stop-Process -Force"
+  echo "Done."
+}
+
+start_skill() {
+  name="$1"
+  if ! [[ -v SKILL_START_CMD["$name"] ]]; then
+    echo "Unknown skill: $name"
+    echo "Available: ${!SKILL_START_CMD[*]}"
+    exit 1
+  fi
+  dir="${SKILL_DIR_MAP[$name]}"
+  cmd="${SKILL_START_CMD[$name]}"
+  echo "Starting $name in $dir..."
+  (
+    cd "$dir"
+    eval "$cmd" &
+  )
+  echo "Started in background. Check with: portmap skills"
+}
+
+cmd="${1:-ls}"
+case "$cmd" in
+  ls|ps|procs) ls_procs ;;
+  ports|port) ls_ports ;;
+  skills|skill) ls_skills ;;
+  kill) kill_by_target "${2:-}";;
+  kill-all|kill-all-node|killnode) kill_all_node ;;
+  start) start_skill "${2:-}";;
+  *)
+    echo "Usage: portmap [ls|ports|skills|kill <pid|port>|kill-all|start <skill-name>]"
+    echo ""
+    echo "Registered skills: ${!SKILL_PORT_MAP[*]}"
+    exit 1
+    ;;
+esac

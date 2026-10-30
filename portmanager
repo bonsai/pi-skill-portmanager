@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# portmanager — CLI to manage TCP/UDP port assignments + file locks
+# Usage: portmanager [command] [options]
+
+set -euo pipefail
+
+COMMAND="${1:-help}"
+shift || true
+
+case "$COMMAND" in
+    check)
+        PORT="${1:-}"
+        if [ -n "$PORT" ]; then
+            # Single port check
+            if ss -tlnp 2>/dev/null | grep -q ":$PORT "; then
+                echo "PORT $PORT: IN USE"
+                ss -tlnp 2>/dev/null | grep ":$PORT " | tail -1
+            else
+                echo "PORT $PORT: FREE"
+            fi
+        else
+            # All listening ports
+            echo "Listening ports:"
+            ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || echo "no ss or netstat"
+        fi
+        ;;
+    find-free)
+        START="${1:-8000}"
+        END="${2:-9000}"
+        for port in $(seq $START $END); do
+            if ! ss -tlnp 2>/dev/null | grep -q ":$port "; then
+                echo "FREE: $port"
+                break
+            fi
+        done
+        ;;
+    kill-port)
+        PORT="${1:-}"
+        [ -z "$PORT" ] && { echo "usage: portmanager kill-port <port>"; exit 1; }
+        PID=$(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
+        if [ -n "$PID" ]; then
+            echo "killing PID $PID on port $PORT"
+            kill $PID 2>/dev/null && echo "killed" || echo "kill failed"
+        else
+            echo "no process on port $PORT"
+        fi
+        ;;
+    lock-check|lockcheck)
+        # ファイル/ディレクトリがロックされているか確認
+        TARGET="${1:-}"
+        [ -z "$TARGET" ] && { echo "Usage: portmanager lock-check <path>"; exit 1; }
+        WPATH=$(wslpath -w "$TARGET" 2>/dev/null || echo "$TARGET")
+        echo "=== lock-check: $TARGET ==="
+        powershell.exe -NoProfile -Command "
+            \$found = \$false
+            Get-Process | Where-Object { \$_.ProcessName -match 'github|opencode|explorer|git|node|python|vscode|Code' } | ForEach-Object {
+                try {
+                    \$proc = \$_
+                    \$cmd = (Get-WmiObject Win32_Process -Filter \"ProcessId=\$(\$proc.Id)\").CommandLine
+                    if (\$cmd -and (\$cmd -match [regex]::Escape('\$WPATH') -or \$cmd -match 'hokusai-manga|40-submit|1028')) {
+                        Write-Host \"PID \$(\$proc.Id) (\$(\$proc.ProcessName)) -> referencing\"
+                        Write-Host \"  Cmd: \$(\$cmd.Substring(0,[math]::Min(100,\$cmd.Length)))\"
+                        \$found = \$true
+                    }
+                } catch {}
+            }
+            if (-not \$found) { Write-Host 'No obvious lock found. Check resmon.exe -> CPU -> Associated Handles' }
+        " 2>/dev/null
+        echo ""
+        echo "Hint: resmon.exe -> CPU -> Associated Handles search '$WPATH'"
+        ;;
+    lock-list|locklist)
+        echo "=== common locker processes ==="
+        powershell.exe -NoProfile -Command '
+            Get-Process |
+            Where-Object { $_.ProcessName -match "github|opencode|git|node|python|vscode|Code|explorer" } |
+            Select-Object Id, ProcessName, @{N="MemMB";E={[math]::Round($_.WorkingSet/1MB,1)}},
+                @{N="Cmd";E={
+                    $c=(Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine
+                    if($c -and $c.Length-gt60){$c.Substring(0,57)+"..."}else{$c}
+                }} |
+            Format-Table -AutoSize
+        '
+        echo ""
+        echo "Kill with: portmanager lock-kill <PID>"
+        ;;
+    lock-kill|lockkill)
+        TARGET="${1:-}"
+        [ -z "$TARGET" ] && { echo "Usage: portmanager lock-kill <pid|path>"; exit 1; }
+        if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+            echo "Stopping PID $TARGET..."
+            powershell.exe -NoProfile -Command "Stop-Process -Id $TARGET -Force"
+            echo "Done."
+        else
+            KEYWORD=$(basename "$TARGET")
+            echo "Searching processes referencing '$KEYWORD' ..."
+            PIDS=$(powershell.exe -NoProfile -Command "
+                \$pids = @()
+                Get-Process | Where-Object { \$_.ProcessName -match 'github|opencode|git|node|python' } | ForEach-Object {
+                    \$cmd = (Get-WmiObject Win32_Process -Filter \"ProcessId=\$(\$_.Id)\").CommandLine
+                    if (\$cmd -and (\$cmd -match [regex]::Escape('\$KEYWORD'))) {
+                        \$pids += \$_.Id
+                    }
+                }
+                \$pids -join ' '
+            " 2>/dev/null | tr -d '\r')
+            if [ -n "$PIDS" ] && [ "$PIDS" != " " ]; then
+                echo "Found PIDs: $PIDS"
+                for pid in $PIDS; do
+                    [ -z "$pid" ] && continue
+                    echo "  Stopping PID $pid..."
+                    powershell.exe -NoProfile -Command "Stop-Process -Id \$pid -Force" && echo "  OK" || echo "  Failed"
+                done
+                sleep 2
+                echo "Attempting removal of '$TARGET' ..."
+                rm -rf "$TARGET" && echo "Removed: $TARGET" || echo "Still locked (check resmon.exe)"
+            else
+                echo "No process found. Trying direct remove..."
+                rm -rf "$TARGET" && echo "Removed: $TARGET" || echo "Failed -- use resmon.exe or restart Windows"
+            fi
+        fi
+        ;;
+    help|"")
+        echo "usage: portmanager <command> [args]"
+        echo ""
+        echo "commands:"
+        echo "  check [port]       Check port status (all or specific)"
+        echo "  find-free [start] [end] Find free port in range"
+        echo "  kill-port <port>   Kill process using port"
+        echo "  lock-check <path>  Check which process locks a file/dir"
+        echo "  lock-list          Show common locker processes"
+        echo "  lock-kill <pid|path> Kill locker process by PID or path keyword"
+        echo "  help               Show this help"
+        ;;
+esac

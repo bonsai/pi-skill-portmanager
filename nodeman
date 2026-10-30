@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# nodeman — Node.exe 一元管理
+#   nodeman ls                node.exe プロセス一覧
+#   nodeman detail <pid>      詳細情報（コマンドライン・ポート）
+#   nodeman ports             node.exe が占有しているポート一覧
+#   nodeman kill <pid|all>    指定PID or 全 node.exe を停止
+#   nodeman kill-port <port>  ポートを占有中の node.exe を停止
+#   nodeman tree              ツリー表示（親子関係）
+
+_ls() {
+  echo "=== Node.exe プロセス一覧 ==="
+  echo "PID      Memory(MB)  Command"
+  echo "-------- ----------  -------"
+  powershell.exe -NoProfile -Command '
+    Get-Process -Name node -ErrorAction SilentlyContinue |
+    Select-Object Id, @{N="Mem";E={[math]::Round($_.WorkingSet/1MB,1)}}, @{N="Cmd";E={
+      $cmd = (Get-WmiObject Win32_Process -Filter \"ProcessId=$($_.Id)\").CommandLine
+      if ($cmd -and $cmd.Length -gt 60) { $cmd.Substring(0,57)+"..." } else { $cmd }
+    }} |
+    Format-Table -AutoSize
+  '
+}
+
+detail() {
+  pid="${1:-}"
+  [ -z "$pid" ] && { echo "Usage: nodeman detail <pid>"; exit 1; }
+  echo "=== PID $pid Detail ==="
+  powershell.exe -NoProfile -Command "
+    \$p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    if (-not \$p) { Write-Host 'Process not found'; exit }
+    \$cmd = (Get-WmiObject Win32_Process -Filter \"ProcessId=$pid\").CommandLine
+    Write-Host \"PID:        \$(\$p.Id)\"
+    Write-Host \"Memory:     \$([math]::Round(\$p.WorkingSet/1MB,1)) MB\"
+    Write-Host \"StartTime:  \$(\$p.StartTime)\"
+    Write-Host \"Command:    \$cmd\"
+    Write-Host \"Ports:      \$( (Get-NetTCPConnection -OwningProcess $pid -ErrorAction SilentlyContinuous |
+                  ForEach-Object { \"\$(\$_.LocalAddress):\$(\$_.LocalPort)\" }) -join ', ' )\"
+  "
+}
+
+ports() {
+  echo "=== Node.exe が占有しているポート ==="
+  echo "PID      Port    State       Address"
+  echo "-------- ------  --------    -------"
+  powershell.exe -NoProfile -Command '
+    Get-Process -Name node -ErrorAction SilentlyContinue | ForEach-Object {
+      $pid = $_.Id
+      Get-NetTCPConnection -OwningProcess $pid -ErrorAction SilentlyContinue |
+      Select-Object @{N="PID";E={$pid}}, LocalPort, State, @{N="Addr";E={$_.LocalAddress}} |
+      Format-Table -AutoSize
+    }
+  '
+}
+
+kill_node() {
+  target="${1:-}"
+  if [ "${target,,}" = "all" ]; then
+    echo "全 node.exe を停止します..."
+    powershell.exe -NoProfile -Command "Get-Process -Name node -ErrorAction SilentlyContinue | Stop-Process -Force"
+    echo "完了"
+  else
+    echo "PID $target を停止..."
+    powershell.exe -NoProfile -Command "Stop-Process -Id $target -Force"
+    echo "完了"
+  fi
+}
+
+kill_port() {
+  port="${1:-}"
+  [ -z "$port" ] && { echo "Usage: nodeman kill-port <port>"; exit 1; }
+  pid=$(powershell.exe -NoProfile -Command "
+    \$conn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+    if (\$conn) { \$conn.OwningProcess } else { 0 }
+  " 2>/dev/null | tr -d '\r')
+  if [ "$pid" != "0" ] && [ -n "$pid" ]; then
+    echo "Port $port は PID $pid (node.exe) に占有されています。停止します..."
+    powershell.exe -NoProfile -Command "Stop-Process -Id $pid -Force"
+    echo "完了"
+  else
+    echo "Port $port は空いているか、node.exe 以外のプロセスが使用しています。"
+    echo "portmap kill $port を試してください。"
+  fi
+}
+
+tree() {
+  echo "=== Node.exe ツリー表示 ==="
+  powershell.exe -NoProfile -Command '
+    Get-Process -Name node -ErrorAction SilentlyContinue | ForEach-Object {
+      $p = $_
+      $parent = (Get-WmiObject Win32_Process -Filter "ProcessId=$($p.Id)").ParentProcessId
+      $parentName = if ($parent) { (Get-Process -Id $parent -ErrorAction SilentlyContinue).ProcessName } else { "?" }
+      $cmd = (Get-WmiObject Win32_Process -Filter "ProcessId=$($p.Id)").CommandLine
+      if ($cmd.Length -gt 50) { $cmd = $cmd.Substring(0,47)+"..." }
+      Write-Host ("[{0,6}] <- [{1,6}] {2,-10}  {3}" -f $p.Id, $parent, $parentName, $cmd)
+    }
+  '
+}
+
+cmd="${1:-ls}"
+case "$cmd" in
+  ls|list|ps) _ls ;;
+  detail) detail "${2:-}" ;;
+  ports|port) ports ;;
+  kill) kill_node "${2:-}" ;;
+  kill-port|killport) kill_port "${2:-}" ;;
+  tree) tree ;;
+  *)
+    echo "Usage: nodeman [ls|detail <pid>|ports|kill <pid|all>|kill-port <port>|tree]"
+    exit 1
+    ;;
+esac
